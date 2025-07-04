@@ -7,9 +7,9 @@ import z from "zod";
 
 import { emailSchema } from "@calcom/lib/emailSchema";
 import { useLocale } from "@calcom/lib/hooks/useLocale";
-import { EmailField } from "@calcom/ui/components/form";
 import { Alert } from "@calcom/ui/components/alert";
 import { Button } from "@calcom/ui/components/button";
+import { EmailField } from "@calcom/ui/components/form";
 import { Form } from "@calcom/ui/components/form";
 import { PasswordField } from "@calcom/ui/components/form";
 import { TextField } from "@calcom/ui/components/form";
@@ -137,6 +137,11 @@ export default function ExchangeSetup() {
                               if (authentication) {
                                 onChange(authentication.value);
                                 form.setValue("authenticationMethod", authentication.value);
+                                // Reset exchange version when switching auth methods
+                                if (authentication.value === ExchangeAuthentication.NTLM) {
+                                  // For NTLM, default to Exchange 2016 which has better compatibility
+                                  form.setValue("exchangeVersion", ExchangeVersion.Exchange2016);
+                                }
                               }
                             }}
                           />

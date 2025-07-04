@@ -44,13 +44,20 @@ export default class ExchangeCalendarService implements Calendar {
   private integrationName = "";
   private log: typeof logger;
   private payload;
+  private _exchangeService?: ExchangeService; // Cache the service instance
 
   constructor(credential: CredentialPayload) {
     this.integrationName = "exchange_calendar";
     this.log = logger.getSubLogger({ prefix: [`[[lib] ${this.integrationName}`] });
-    this.payload = JSON.parse(
-      symmetricDecrypt(credential.key?.toString() || "", process.env.CALENDSO_ENCRYPTION_KEY || "")
-    );
+
+    try {
+      this.payload = JSON.parse(
+        symmetricDecrypt(credential.key?.toString() || "", process.env.CALENDSO_ENCRYPTION_KEY || "")
+      );
+    } catch (error) {
+      this.log.error("Failed to decrypt Exchange credentials:", error);
+      throw new Error("Invalid or corrupted Exchange credentials");
+    }
   }
 
   async createEvent(event: CalendarEvent): Promise<NewCalendarEventType> {
@@ -197,34 +204,51 @@ export default class ExchangeCalendarService implements Calendar {
   }
 
   private async getExchangeService(): Promise<ExchangeService> {
+    // Return cached service if available
+    if (this._exchangeService) {
+      return this._exchangeService;
+    }
+
     try {
+      // Validate payload before proceeding
+      if (!this.payload?.url || !this.payload?.username || !this.payload?.password) {
+        throw new Error("Missing required Exchange configuration parameters");
+      }
+
       const service: ExchangeService = new ExchangeService(this.payload.exchangeVersion);
       service.Credentials = new WebCredentials(this.payload.username, this.payload.password);
       service.Url = new Uri(this.payload.url);
-      
-      if (this.payload.authenticationMethod === ExchangeAuthentication.NTLM) {
-        // Fix for Node.js OpenSSL compatibility issues with NTLM
-        try {
-          // Set Node.js to use legacy OpenSSL provider if needed
-          if (process.env.NODE_OPTIONS && !process.env.NODE_OPTIONS.includes('--openssl-legacy-provider')) {
-            process.env.NODE_OPTIONS = `${process.env.NODE_OPTIONS} --openssl-legacy-provider`;
-          } else if (!process.env.NODE_OPTIONS) {
-            process.env.NODE_OPTIONS = '--openssl-legacy-provider';
-          }
 
+      if (this.payload.authenticationMethod === ExchangeAuthentication.NTLM) {
+        // Enhanced NTLM authentication setup for on-premise Exchange
+        try {
           const { XhrApi } = await import("@ewsjs/xhr");
           const xhr = new XhrApi({
             rejectUnauthorized: false,
-            // Additional options for better on-premise Exchange compatibility
-            timeout: 30000, // 30 second timeout
+            timeout: 30000, // 30 second timeout for better reliability
           }).useNtlmAuthentication(this.payload.username, this.payload.password);
-          
+
           service.XHRApi = xhr;
           this.log.info("NTLM authentication configured for Exchange service");
         } catch (ntlmError) {
           this.log.error("Error configuring NTLM authentication:", ntlmError);
-          // Fallback to standard authentication if NTLM fails
-          this.log.info("Falling back to standard authentication");
+
+          // Check if it's an OpenSSL compatibility issue
+          if (
+            ntlmError instanceof Error &&
+            ntlmError.message.includes("digital envelope routines::unsupported")
+          ) {
+            throw new Error(
+              'Node.js OpenSSL compatibility issue with NTLM authentication. Please set NODE_OPTIONS="--openssl-legacy-provider" in your environment or use Basic authentication instead.'
+            );
+          }
+
+          // For other NTLM errors, provide fallback suggestion
+          throw new Error(
+            `NTLM authentication failed: ${
+              ntlmError instanceof Error ? ntlmError.message : "Unknown error"
+            }. Consider using Basic authentication instead.`
+          );
         }
       } else {
         // Enhanced Basic Authentication setup for on-premise Exchange
@@ -232,28 +256,67 @@ export default class ExchangeCalendarService implements Calendar {
         this.log.info("Basic authentication configured for Exchange service");
       }
 
+      // Cache the service for reuse
+      this._exchangeService = service;
       return service;
     } catch (error) {
       this.log.error("Error creating Exchange service:", error);
-      
+
       // Provide more specific error messages based on the error type
       if (error instanceof Error) {
-        if (error.message.includes('digital envelope routines::unsupported')) {
+        // Re-throw our custom errors as-is
+        if (
+          error.message.includes("NODE_OPTIONS") ||
+          error.message.includes("Missing required") ||
+          error.message.includes("NTLM authentication failed")
+        ) {
+          throw error;
+        }
+
+        // Handle common Exchange connection issues
+        if (error.message.includes("401") || error.message.includes("Unauthorized")) {
+          throw new Error(
+            "Authentication failed. Please verify your username, password, and ensure the account has proper Exchange permissions."
+          );
+        } else if (
+          error.message.includes("timeout") ||
+          error.message.includes("ECONNREFUSED") ||
+          error.message.includes("ENOTFOUND")
+        ) {
+          throw new Error(
+            "Cannot connect to Exchange server. Please verify the EWS URL is correct and the server is accessible."
+          );
+        } else if (
+          error.message.includes("certificate") ||
+          error.message.includes("SSL") ||
+          error.message.includes("TLS")
+        ) {
+          throw new Error(
+            "SSL/TLS certificate issue. Your Exchange server may be using a self-signed certificate."
+          );
+        } else if (error.message.includes("digital envelope routines::unsupported")) {
           throw new Error(
             'Node.js OpenSSL compatibility issue. Please set NODE_OPTIONS="--openssl-legacy-provider" or upgrade your Exchange server configuration.'
           );
-        } else if (error.message.includes('401') || error.message.includes('Unauthorized')) {
-          throw new Error(
-            'Authentication failed. Please verify your username, password, and ensure the account has proper Exchange permissions.'
-          );
-        } else if (error.message.includes('timeout') || error.message.includes('ECONNREFUSED')) {
-          throw new Error(
-            'Cannot connect to Exchange server. Please verify the EWS URL and ensure the server is accessible.'
-          );
         }
       }
-      
+
       throw error;
+    }
+  }
+
+  /**
+   * Cleanup method to release resources
+   */
+  public cleanup(): void {
+    if (this._exchangeService) {
+      try {
+        // Clear any cached credentials or connections
+        this._exchangeService = undefined;
+        this.log.debug("Exchange service cleanup completed");
+      } catch (error) {
+        this.log.warn("Error during Exchange service cleanup:", error);
+      }
     }
   }
 }
